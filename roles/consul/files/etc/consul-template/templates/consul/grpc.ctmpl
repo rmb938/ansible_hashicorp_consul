@@ -1,0 +1,5 @@
+{{- with pkiCert "pki_consul_rpc_intermediate/issue/pki_consul_rpc_intermediate_0" "common_name=server.us-homelab1.consul" -}}
+{{ .Cert }}{{ .CA }}{{ .CAChain }}{{ .Key }}
+{{ .Key | writeToFile "/opt/consul/tls/grpc.key" "" "" "0600" }}
+{{ (printf "%s%s" .Cert (.CAChain | join "")) | writeToFile "/opt/consul/tls/grpc.crt" "" "" "0644" }}
+{{- end -}}

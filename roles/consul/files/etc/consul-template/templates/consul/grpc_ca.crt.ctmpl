@@ -1,0 +1,3 @@
+{{ with secret "secret/consul/pki_consul_rpc_chains" }}
+{{ .Data.chains }}
+{{ end }}

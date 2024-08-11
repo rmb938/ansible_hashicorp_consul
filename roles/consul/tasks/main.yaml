@@ -1,0 +1,302 @@
+---
+# TODO: CIS benchmark fixing once it's released for 24.04
+
+# TODO: covert bootstrap steps to own role, see https://ruan.dev/blog/2022/04/19/publish-and-use-your-ansible-role-from-git
+## START BOOTSTRAP
+- name: Set timezone
+  community.general.timezone:
+    name: America/Chicago
+
+- name: Configure Auto Upgrades
+  ansible.builtin.template:
+    src: etc/apt/apt.conf.d/50unattended-upgrades
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
+    mode: "0644"
+  register: unattended_upgrades_50
+
+- name: Restart unattended-upgrades # noqa: no-handler
+  ansible.builtin.systemd:
+    name: unattended-upgrades
+    state: restarted
+  when: unattended_upgrades_50.changed
+
+- name: Install tools
+  ansible.builtin.package:
+    name:
+      - net-tools
+      - htop
+      - unzip
+    state: present
+## END BOOTSTRAP
+
+# Start Hashicorp
+- name: Install Hashicorp keyring
+  ansible.builtin.get_url:
+    url: https://apt.releases.hashicorp.com/gpg
+    dest: /usr/share/keyrings/hashicorp-archive-keyring.asc
+    checksum: sha256:cafb01beac341bf2a9ba89793e6dd2468110291adfbb6c62ed11a0cde6c09029
+    mode: "0644"
+
+- name: Add Hashicorp repo
+  ansible.builtin.apt_repository:
+    repo: >
+      deb [arch=amd64 signed-by=/usr/share/keyrings/hashicorp-archive-keyring.asc]
+      https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main
+    state: present
+
+- name: Install Hashicorp Vault & Consul
+  ansible.builtin.package:
+    name:
+      - vault
+      - consul
+    state: present
+# End Hashicorp
+
+# Start Vault Agent
+- name: Generate vault tailscale certificates
+  ansible.builtin.command:
+    cmd: >
+      /usr/bin/tailscale cert
+      --cert-file /opt/vault/tls/{{ inventory_hostname }}.crt
+      --key-file /opt/vault/tls/{{ inventory_hostname }}.key
+      {{ inventory_hostname }}
+    creates: /opt/vault/tls/{{ inventory_hostname }}.crt
+
+- name: Own vault tailscale certificates to vault
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: vault
+    group: vault
+  with_items:
+    - "/opt/vault/tls/{{ inventory_hostname }}.crt"
+    - "/opt/vault/tls/{{ inventory_hostname }}.key"
+
+- name: Cronjob to renew vault tailscale certificates
+  ansible.builtin.cron:
+    name: Renew tailscale Vault certificates
+    special_time: daily
+    job: >
+      /usr/bin/tailscale cert
+      --cert-file /opt/vault/tls/{{ inventory_hostname }}.crt
+      --key-file /opt/vault/tls/{{ inventory_hostname }}.key
+      {{ inventory_hostname }} &&
+      /usr/bin/chown vault:vault /opt/vault/tls/{{ inventory_hostname }}.crt /opt/vault/tls/{{ inventory_hostname }}.key &&
+      /usr/bin/systemctl reload vault
+
+- name: Configure Vault Agent
+  ansible.builtin.template:
+    src: etc/vault.d/vault.hcl
+    dest: /etc/vault.d/vault.hcl
+    mode: "0644"
+  register: vault_config
+
+- name: Create Vault Agent systemd override folder
+  ansible.builtin.file:
+    path: /etc/systemd/system/vault.service.d/
+    state: directory
+    mode: "0755"
+
+- name: Vault Agent systemd Override
+  ansible.builtin.template:
+    src: etc/systemd/system/vault.service.d/override.conf
+    dest: /etc/systemd/system/vault.service.d/override.conf
+    mode: "0644"
+  register: vault_systemd
+
+- name: Reload Vault Agent systemd # noqa: no-handler
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: vault_systemd.changed
+
+- name: Start and enable Vault
+  ansible.builtin.systemd:
+    name: vault
+    state: started
+    enabled: true
+
+- name: Restart vault Agent if config changed # noqa: no-handler
+  ansible.builtin.systemd:
+    name: vault
+    state: restarted
+  when: vault_config.changed
+# End Vault Agent
+
+# Start Consul Template for Consul
+- name: Download Consul Template
+  ansible.builtin.get_url:
+    url: https://releases.hashicorp.com/consul-template/0.39.1/consul-template_0.39.1_linux_amd64.zip
+    checksum: "sha256:b77c7550defda78c62b036c734e7faceb7f89519dc12406db84f2c3af06bc5fb"
+    mode: "0644"
+    dest: /tmp/consul-template.zip
+
+- name: Install Consul Template
+  ansible.builtin.unarchive:
+    remote_src: true
+    src: /tmp/consul-template.zip
+    dest: /usr/bin
+    include:
+      - consul-template
+
+- name: File Perms for Consul Template
+  ansible.builtin.file:
+    path: /usr/bin/consul-template
+    mode: "0755"
+    owner: root
+    group: root
+
+- name: Add Consul to sudoers
+  community.general.sudoers:
+    name: consul
+    user: consul
+    nopassword: true
+    validation: required
+    commands:
+      - /usr/bin/systemd reload consul
+    state: present
+
+- name: Create Consul Template Dir
+  ansible.builtin.file:
+    path: /etc/consul-template
+    mode: "0755"
+    owner: root
+    group: root
+    state: directory
+
+- name: Configure Consul Template for Consul
+  ansible.builtin.template:
+    src: etc/consul-template/consul-template-consul.hcl
+    dest: /etc/consul-template/consul-template-consul.hcl
+    mode: "0644"
+    owner: consul
+    group: consul
+  register: consul_template_consul_config
+
+- name: Create Consul Template for Consul Templates directory
+  ansible.builtin.file:
+    path: /etc/consul-template/templates/consul/
+    state: directory
+    mode: "0744"
+    owner: consul
+    group: consul
+
+- name: Place Consul Template for Consul Templates
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/consul-template/templates/consul/{{ item | basename }}"
+    mode: "0644"
+    owner: consul
+    group: consul
+  with_fileglob:
+    - ../files/etc/consul-template/templates/consul/*.ctmpl
+  register: consul_template_consul_templates
+
+- name: Consul Template for Consul SystemD
+  ansible.builtin.template:
+    src: etc/systemd/system/consul-template-consul.service
+    dest: /etc/systemd/system/consul-template-consul.service
+    mode: "0644"
+  register: consul_template_consul_systemd
+
+- name: Consul Template for Consul systemd # noqa: no-handler
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: consul_template_consul_systemd.changed
+
+- name: Start and enable Consul Template for Consul
+  ansible.builtin.systemd:
+    name: consul-template-consul
+    state: started
+    enabled: true
+
+- name: Restart Consul Template for Consul  if config changed # noqa: no-handler
+  ansible.builtin.systemd:
+    name: consul-template-consul
+    state: restarted
+  when: consul_template_consul_config.changed or consul_template_consul_templates.changed
+# End Consul Template for Consul
+
+- name: Install hvac
+  ansible.builtin.package:
+    name: python3-hvac
+    state: present
+
+- name: Make consul tls dir
+  ansible.builtin.file:
+    path: /opt/consul/tls
+    state: directory
+    mode: "0770"
+    owner: consul
+    group: consul
+
+- name: Make consul tls ca dir
+  ansible.builtin.file:
+    path: /opt/consul/tls/ca
+    state: directory
+    mode: "0770"
+    owner: consul
+    group: consul
+
+- name: Make consul data dir
+  ansible.builtin.file:
+    path: /opt/consul/data
+    state: directory
+    mode: "0700"
+    owner: consul
+    group: consul
+
+- name: Generate consul tailscale certificates
+  ansible.builtin.command:
+    cmd: >
+      /usr/bin/tailscale cert
+      --cert-file /opt/consul/tls/{{ inventory_hostname }}.crt
+      --key-file /opt/consul/tls/{{ inventory_hostname }}.key
+      {{ inventory_hostname }}
+    creates: /opt/consul/tls/{{ inventory_hostname }}.crt
+
+- name: Own consul tailscale certificates to consul
+  ansible.builtin.file:
+    path: "{{ item }}"
+    owner: consul
+    group: consul
+  with_items:
+    - "/opt/consul/tls/{{ inventory_hostname }}.crt"
+    - "/opt/consul/tls/{{ inventory_hostname }}.key"
+
+- name: Cronjob to renew consul tailscale certificates
+  ansible.builtin.cron:
+    name: Renew tailscale consul certificates
+    special_time: daily
+    job: >
+      /usr/bin/tailscale cert
+      --cert-file /opt/consul/tls/{{ inventory_hostname }}.crt
+      --key-file /opt/consul/tls/{{ inventory_hostname }}.key
+      {{ inventory_hostname }} &&
+      /usr/bin/chown consul:consul /opt/consul/tls/{{ inventory_hostname }}.crt /opt/consul/tls/{{ inventory_hostname }}.key &&
+      /usr/bin/systemctl reload consul
+
+- name: Read Consul Encrypt Key from Vault
+  community.hashi_vault.vault_kv1_get:
+    url: http://127.0.0.1:8100
+    auth_method: none
+    engine_mount_point: secret
+    path: consul/encrypt_key
+  register: consule_encrypt_key
+
+- name: Configure Consul
+  ansible.builtin.template:
+    src: etc/consul.d/consul.hcl
+    dest: /etc/consul.d/consul.hcl
+    mode: "0644"
+  register: consul_config
+
+- name: Start and enable Consul
+  ansible.builtin.systemd:
+    name: consul
+    state: started
+    enabled: true
+
+- name: Restart consul if config changed # noqa: no-handler
+  ansible.builtin.systemd:
+    name: consul
+    state: restarted
+  when: consul_config.changed

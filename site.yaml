@@ -1,0 +1,5 @@
+- name: Hashicorp Consul
+  hosts: all
+  become: true
+  roles:
+    - consul
