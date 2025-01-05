@@ -1,4 +1,37 @@
 ---
+- name: Create datavg
+  community.general.lvg:
+    vg: data
+    pvs: /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1
+
+- name: Create consul lv
+  community.general.lvol:
+    vg: data
+    lv: consul
+    size: 95G
+
+- name: Format consul lv
+  community.general.filesystem:
+    fstype: xfs
+    dev: /dev/data/consul
+
+- name: Mount consul drive
+  ansible.posix.mount:
+    path: /opt/consul/data
+    src: /dev/data/consul
+    fstype: xfs
+    boot: true
+    state: mounted
+
+- name: Bootstrap step cli
+  ansible.builtin.command: >-
+    step ca bootstrap --ca-url https://step-ca-ra.rmb938.me \
+      --fingerprint eb136a5118931a2306964469705323521dda8c43d26ec67e1c5508eb123f9c70
+  args:
+    creates: /etc/step/config/defaults.json
+  environment:
+    STEPPATH: /etc/step
+
 # Start Hashicorp
 - name: Install Hashicorp keyring
   ansible.builtin.get_url:
@@ -19,6 +52,7 @@
     name:
       - vault
       - consul
+      - consul-template
     state: present
 # End Hashicorp
 
@@ -27,31 +61,31 @@
   ansible.builtin.command:
     cmd: >
       /usr/bin/tailscale cert
-      --cert-file /opt/vault/tls/{{ inventory_hostname }}.crt
-      --key-file /opt/vault/tls/{{ inventory_hostname }}.key
+      --cert-file /opt/vault/tls/vault.crt
+      --key-file /opt/vault/tls/vault.key
       {{ inventory_hostname }}
-    creates: /opt/vault/tls/{{ inventory_hostname }}.crt
+    creates: /opt/vault/tls/vault.crt
 
 - name: Own vault tailscale certificates to vault
   ansible.builtin.file:
     path: "{{ item }}"
     owner: vault
     group: vault
+    mode: "0600"
   with_items:
-    - "/opt/vault/tls/{{ inventory_hostname }}.crt"
-    - "/opt/vault/tls/{{ inventory_hostname }}.key"
+    - "/opt/vault/tls/vault.crt"
+    - "/opt/vault/tls/vault.key"
 
 - name: Cronjob to renew vault tailscale certificates
   ansible.builtin.cron:
     name: Renew tailscale Vault certificates
     special_time: daily
-    job: >
+    job: >-
       /usr/bin/tailscale cert
-      --cert-file /opt/vault/tls/{{ inventory_hostname }}.crt
-      --key-file /opt/vault/tls/{{ inventory_hostname }}.key
+      --cert-file /opt/vault/tls/vault.crt
+      --key-file /opt/vault/tls/vault.key
       {{ inventory_hostname }} &&
-      /usr/bin/chown vault:vault /opt/vault/tls/{{ inventory_hostname }}.crt /opt/vault/tls/{{ inventory_hostname }}.key &&
-      /usr/bin/systemctl reload vault
+      /usr/bin/chown vault:vault /opt/vault/tls/vault.crt /opt/vault/tls/vault.key
 
 - name: Configure Vault Agent
   ansible.builtin.template:
@@ -92,28 +126,6 @@
 # End Vault Agent
 
 # Start Consul Template for Consul
-- name: Download Consul Template
-  ansible.builtin.get_url:
-    url: https://releases.hashicorp.com/consul-template/0.39.1/consul-template_0.39.1_linux_amd64.zip
-    checksum: "sha256:b77c7550defda78c62b036c734e7faceb7f89519dc12406db84f2c3af06bc5fb"
-    mode: "0644"
-    dest: /tmp/consul-template.zip
-
-- name: Install Consul Template
-  ansible.builtin.unarchive:
-    remote_src: true
-    src: /tmp/consul-template.zip
-    dest: /usr/bin
-    include:
-      - consul-template
-
-- name: File Perms for Consul Template
-  ansible.builtin.file:
-    path: /usr/bin/consul-template
-    mode: "0755"
-    owner: root
-    group: root
-
 - name: Add Consul to sudoers
   community.general.sudoers:
     name: consul
@@ -178,7 +190,7 @@
     state: started
     enabled: true
 
-- name: Restart Consul Template for Consul  if config changed # noqa: no-handler
+- name: Restart Consul Template for Consul if config changed # noqa: no-handler
   ansible.builtin.systemd:
     name: consul-template-consul
     state: restarted
@@ -198,51 +210,32 @@
     owner: consul
     group: consul
 
-- name: Make consul tls ca dir
+- name: Create Consul Certificates
+  ansible.builtin.command: >-
+    step ca certificate {{ ansible_fqdn }} /opt/consul/tls/https.crt /opt/consul/tls/https.key
+  args:
+    creates: "/opt/consul/tls/https.crt"
+  environment:
+    STEPPATH: "/etc/step"
+
+- name: Own Consul certificates
   ansible.builtin.file:
-    path: /opt/consul/tls/ca
-    state: directory
-    mode: "0770"
+    path: /opt/consul/tls/{{ item }}
     owner: consul
     group: consul
-
-- name: Make consul data dir
-  ansible.builtin.file:
-    path: /opt/consul/data
-    state: directory
-    mode: "0700"
-    owner: consul
-    group: consul
-
-- name: Generate consul tailscale certificates
-  ansible.builtin.command:
-    cmd: >
-      /usr/bin/tailscale cert
-      --cert-file /opt/consul/tls/{{ inventory_hostname }}.crt
-      --key-file /opt/consul/tls/{{ inventory_hostname }}.key
-      {{ inventory_hostname }}
-    creates: /opt/consul/tls/{{ inventory_hostname }}.crt
-
-- name: Own consul tailscale certificates to consul
-  ansible.builtin.file:
-    path: "{{ item }}"
-    owner: consul
-    group: consul
+    mode: "0600"
   with_items:
-    - "/opt/consul/tls/{{ inventory_hostname }}.crt"
-    - "/opt/consul/tls/{{ inventory_hostname }}.key"
+    - https.crt
+    - https.key
 
-- name: Cronjob to renew consul tailscale certificates
+- name: Cron to renew consul certificates
   ansible.builtin.cron:
-    name: Renew tailscale consul certificates
-    special_time: daily
-    job: >
-      /usr/bin/tailscale cert
-      --cert-file /opt/consul/tls/{{ inventory_hostname }}.crt
-      --key-file /opt/consul/tls/{{ inventory_hostname }}.key
-      {{ inventory_hostname }} &&
-      /usr/bin/chown consul:consul /opt/consul/tls/{{ inventory_hostname }}.crt /opt/consul/tls/{{ inventory_hostname }}.key &&
-      /usr/bin/systemctl reload consul
+    name: "renew consul certificates"
+    special_time: "hourly"
+    job: >-
+      STEPPATH=/etc/step step ca renew /opt/consul/tls/https.crt /opt/consul/tls/https.key
+      --force --mtls=false --expires-in 720h --exec "systemctl reload consul"
+    state: present
 
 - name: Read Consul Encrypt Key from Vault
   community.hashi_vault.vault_kv1_get:
@@ -250,13 +243,21 @@
     auth_method: none
     engine_mount_point: secret
     path: consul/encrypt_key
-  register: consule_encrypt_key
+  register: consul_encrypt_key
+
+- name: Read Consul Management Token from Vault
+  community.hashi_vault.vault_kv1_get:
+    url: http://127.0.0.1:8100
+    auth_method: none
+    engine_mount_point: secret
+    path: consul/management_token
+  register: consul_management_token
 
 - name: Configure Consul
   ansible.builtin.template:
     src: etc/consul.d/consul.hcl
     dest: /etc/consul.d/consul.hcl
-    mode: "0644"
+    mode: "0600"
   register: consul_config
 
 - name: Start and enable Consul
